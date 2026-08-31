@@ -1,0 +1,3 @@
+[submodule "third_party/ProcVLM"]
+	path = third_party/ProcVLM
+	url = https://github.com/RUCKBReasoning/ProcVLM.git

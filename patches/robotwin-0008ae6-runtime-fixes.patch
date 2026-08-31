@@ -1,0 +1,790 @@
+diff --git a/envs/_base_task.py b/envs/_base_task.py
+index 79fc885..cd6ca0d 100644
+--- a/envs/_base_task.py
++++ b/envs/_base_task.py
+@@ -35,6 +35,21 @@ current_file_path = os.path.abspath(__file__)
+ parent_directory = os.path.dirname(current_file_path)
+ 
+ 
++def _robotwin_reuse_scene_enabled():
++    """Toggle for the 'reuse SAPIEN scene across episode resets' optimization.
++
++    OFF by default. When OFF, all scene lifecycle behavior is byte-identical to
++    the original (the scene is destroyed and rebuilt on every reset). When ON,
++    the persistent SAPIEN Scene is cleared and reused across resets, and is only
++    truly destroyed on the final (update-boundary) close so the GPU is freed.
++    """
++    return os.environ.get("ROBOTWIN_REUSE_SCENE", "0").strip().lower() in (
++        "1",
++        "true",
++        "yes",
++    )
++
++
+ class Base_Task(gym.Env):
+ 
+     def __init__(self):
+@@ -66,6 +81,7 @@ class Base_Task(gym.Env):
+         self.save_dir = kwags.get("save_path", "data")
+         self.ep_num = kwags.get("now_ep_num", 0)
+         self.render_freq = kwags.get("render_freq", 10)
++        self.render_every_control_step = kwags.get("render_every_control_step", True)
+         self.data_type = kwags.get("data_type", None)
+         self.save_data = kwags.get("save_data", False)
+         self.dual_arm = kwags.get("dual_arm", True)
+@@ -204,23 +220,40 @@ class Base_Task(gym.Env):
+         Set the scene
+             - Set up the basic scene: light source, viewer.
+         """
+-        self.engine = sapien.Engine()
+-        # declare sapien renderer
+-        from sapien.render import set_global_config
+-
+-        set_global_config(max_num_materials=50000, max_num_textures=50000)
+-        self.renderer = sapien.SapienRenderer()
+-        # give renderer to sapien sim
+-        self.engine.set_renderer(self.renderer)
+-
+-        sapien.render.set_camera_shader_dir("rt")
+-        sapien.render.set_ray_tracing_samples_per_pixel(32)
+-        sapien.render.set_ray_tracing_path_depth(8)
+-        sapien.render.set_ray_tracing_denoiser("oidn")
+-
+-        # declare sapien scene
+-        scene_config = sapien.SceneConfig()
+-        self.scene = self.engine.create_scene(scene_config)
++        _reuse_scene = _robotwin_reuse_scene_enabled()
++        if _reuse_scene and getattr(self, "scene", None) is not None:
++            # REUSE PATH: a persistent SAPIEN Scene already exists (this is a
++            # non-final reset). Clear all per-episode entities/actors/lights/
++            # cameras off the existing scene and reuse the existing engine/
++            # renderer instead of creating new ones. The process-global renderer
++            # and ray-tracing config (shader dir / spp / path_depth / denoiser)
++            # were already applied when the scene was first created and are
++            # process-global + idempotent, so we deliberately do NOT re-apply
++            # them here (set_global_config in particular must only be called
++            # before any renderer objects exist). No np.random / torch RNG is
++            # consumed in this block, exactly as in the create path below, so the
++            # per-episode randomization sequence is preserved bit-for-bit.
++            self.scene.clear()
++        else:
++            # CREATE PATH (default, and first reset / post-update-destroy when
++            # reuse is on): identical to the original behavior.
++            self.engine = sapien.Engine()
++            # declare sapien renderer
++            from sapien.render import set_global_config
++
++            set_global_config(max_num_materials=50000, max_num_textures=50000)
++            self.renderer = sapien.SapienRenderer()
++            # give renderer to sapien sim
++            self.engine.set_renderer(self.renderer)
++
++            sapien.render.set_camera_shader_dir("rt")
++            sapien.render.set_ray_tracing_samples_per_pixel(32)
++            sapien.render.set_ray_tracing_path_depth(8)
++            sapien.render.set_ray_tracing_denoiser("oidn")
++
++            # declare sapien scene
++            scene_config = sapien.SceneConfig()
++            self.scene = self.engine.create_scene(scene_config)
+         # set simulation timestep
+         self.scene.set_timestep(kwargs.get("timestep", 1 / 250))
+         # add ground to scene
+@@ -627,7 +660,7 @@ class Base_Task(gym.Env):
+     def _set_eval_video_ffmpeg(self, ffmpeg):
+         self.eval_video_ffmpeg = ffmpeg
+ 
+-    def close_env(self, clear_cache=False):
++    def close_env(self, clear_cache=False, final=False):
+         if hasattr(self, "eval_video_ffmpeg"):
+             try:
+                 self._del_eval_video_ffmpeg()
+@@ -647,6 +680,22 @@ class Base_Task(gym.Env):
+         if hasattr(self, "robot"):
+             self.robot = None
+ 
++        _reuse_scene = _robotwin_reuse_scene_enabled()
++        if _reuse_scene and not final:
++            # REUSE PATH (per-episode reset): keep the persistent SAPIEN
++            # scene/renderer/engine ALIVE so the next setup_scene can clear and
++            # reuse them. We deliberately do NOT null scene/renderer/engine and
++            # do NOT run gc + sapien_clear_cache here: tearing down the Vulkan
++            # resources is exactly what causes the cross-process teardown
++            # SIGSEGV and the per-reset cost we are eliminating. The robot and
++            # cameras were nulled above (identically to the destroy path) and are
++            # rebuilt fresh each reset; setup_scene calls scene.clear() to drop
++            # all per-episode entities/actors/lights/cameras off the persistent
++            # scene. The final (update-boundary) close still passes final=True
++            # below to genuinely destroy the scene and return GPU memory.
++            self.close()
++            return
++
+         if hasattr(self, "scene"):
+             self.scene = None
+ 
+@@ -657,9 +706,23 @@ class Base_Task(gym.Env):
+             self.engine = None
+ 
+         if clear_cache:
+-            # for actor in self.scene.get_all_actors():
+-            #     self.scene.remove_actor(actor)
+-            sapien_clear_cache()
++            # CROSS-PROCESS serialize the SAPIEN teardown. ~6 env-worker processes share each GPU and hit
++            # this at the same epoch boundary, concurrently freeing Vulkan resources (gc-forced C++ destructors
++            # + the process-global sapien_clear_cache) -> intermittently corrupts the GPU driver -> SIGSEGV.
++            # A machine-wide flock makes only ONE process tear down at a time. Accuracy-neutral (no change to
++            # rendering/physics/observations); flock auto-releases if a process dies mid-teardown. gc.collect()
++            # forces the just-nulled scene/renderer/engine to be destructed inside the lock, before clear_cache.
++            import fcntl as _fcntl, gc as _gc
++            _lf = open("/tmp/robotwin_sapien_teardown.lock", "w")
++            try:
++                _fcntl.flock(_lf, _fcntl.LOCK_EX)
++                _gc.collect()
++                sapien_clear_cache()
++            finally:
++                try:
++                    _fcntl.flock(_lf, _fcntl.LOCK_UN)
++                finally:
++                    _lf.close()
+         self.close()
+ 
+     def _del_eval_video_ffmpeg(self):
+@@ -1925,7 +1988,8 @@ class Base_Task(gym.Env):
+                 now_right_id += 1
+ 
+             self.scene.step()
+-            self._update_render()
++            if self.render_every_control_step:
++                self._update_render()
+             steps_executed += 1
+ 
+             if self.check_success():
+diff --git a/envs/robot/planner.py b/envs/robot/planner.py
+index f086bf7..e3d1cca 100644
+--- a/envs/robot/planner.py
++++ b/envs/robot/planner.py
+@@ -528,8 +528,6 @@ try:
+             return result_p, result_q
+ 
+ except Exception as e:
+-    print('[planner.py]: Something wrong happened when importing CuroboPlanner! Please check if Curobo is installed correctly. If the problem still exists, you can install Curobo from https://github.com/NVlabs/curobo manually.')
+-    print('Exception traceback:')
+-    traceback.print_exc()
++    print(f'[planner.py]: CuroboPlanner is unavailable ({type(e).__name__}: {e}). This is expected when planner_backend=mplib.')
+     # If Curobo is not available, set CuroboPlanner to None
+-    CuroboPlanner = None
+\ No newline at end of file
++    CuroboPlanner = None
+diff --git a/robotwin/envs/vector_env.py b/robotwin/envs/vector_env.py
+index c55d3b4..44a59d9 100644
+--- a/robotwin/envs/vector_env.py
++++ b/robotwin/envs/vector_env.py
+@@ -2,6 +2,7 @@ import importlib
+ import os
+ import gc
+ import sys
++import json
+ 
+ import cv2
+ import torch
+@@ -34,6 +35,91 @@ logging.basicConfig(
+ logging.getLogger("concurrent.futures").setLevel(logging.WARNING)
+ logging.getLogger("curobo").setLevel(logging.ERROR)
+ 
++_PROCESS_SCENE_LOCK = threading.RLock()
++
++
++def _get_env_flag(name, default=False):
++    value = os.getenv(name)
++    if value is None:
++        return default
++    return value.strip().lower() in {"1", "true", "yes", "on"}
++
++
++def _get_env_float(name, default=None):
++    value = os.getenv(name)
++    if value is None or value.strip() == "":
++        return default
++    try:
++        return float(value)
++    except ValueError:
++        logging.warning("Invalid %s=%r; using %r.", name, value, default)
++        return default
++
++
++def _get_env_int(name, default):
++    value = os.getenv(name)
++    if value is None or value.strip() == "":
++        return default
++    try:
++        return int(value)
++    except ValueError:
++        logging.warning("Invalid %s=%r; using %r.", name, value, default)
++        return default
++
++
++def _get_vector_env_max_workers(n_envs):
++    value = os.getenv("ROBOTWIN_VECTOR_ENV_MAX_WORKERS")
++    if value is None or value.strip() == "":
++        return n_envs
++    try:
++        max_workers = int(value)
++    except ValueError:
++        logging.warning(
++            "Invalid ROBOTWIN_VECTOR_ENV_MAX_WORKERS=%r; using %s workers.",
++            value,
++            n_envs,
++        )
++        return n_envs
++    if max_workers <= 0:
++        return n_envs
++    return max(1, min(n_envs, max_workers))
++
++
++def _load_action_delta_limit(action_dim):
++    fallback_delta = _get_env_float("ROBOTWIN_ACTION_GUARD_MAX_DELTA", 0.75)
++    delta_limit = np.full(action_dim, fallback_delta, dtype=np.float32)
++    stats_path = os.getenv("ROBOTWIN_ACTION_STATS_PATH")
++    if not stats_path:
++        return delta_limit
++    try:
++        with open(stats_path, "r", encoding="utf-8") as f:
++            stats = json.load(f)
++        stats = stats.get("norm_stats", stats)
++        action_stats = stats.get("actions", stats.get("action"))
++        if action_stats is None:
++            raise KeyError("actions")
++        q01 = np.asarray(action_stats["q01"], dtype=np.float32)
++        q99 = np.asarray(action_stats["q99"], dtype=np.float32)
++        stats_limit = np.maximum(np.abs(q01), np.abs(q99))[:action_dim]
++        delta_limit[: stats_limit.shape[0]] = stats_limit
++    except Exception as exc:
++        logging.warning(
++            "Failed to load RoboTwin action guard stats from %s: %s; using max_delta=%s.",
++            stats_path,
++            exc,
++            fallback_delta,
++        )
++
++    scale = _get_env_float("ROBOTWIN_ACTION_GUARD_DELTA_SCALE", 1.0)
++    return np.maximum(delta_limit * scale, 1e-3).astype(np.float32)
++
++
++def _array_range(values):
++    finite = np.asarray(values)[np.isfinite(values)]
++    if finite.size == 0:
++        return "all-nonfinite"
++    return f"{float(finite.min()):.4g}..{float(finite.max()):.4g}"
++
+ 
+ def class_decorator(task_name):
+     envs_module = importlib.import_module(f"envs.{task_name}")
+@@ -72,10 +158,11 @@ class SubEnv:
+         env_seed: int = None,
+         instruction_type = "seen",
+         global_lock=None,
++        serialize_scene_step=False,
+     ):
+         self.env_id = env_id
+         self.task_name = task_name
+-        self.args = args
++        self.args = dict(args)
+         self.env_seed = env_seed
+         if self.env_seed is None:
+             self.env_seed = self.env_id
+@@ -83,9 +170,52 @@ class SubEnv:
+         self.task = class_decorator(self.task_name)
+         self.instruction_type = instruction_type
+         self.global_lock = global_lock
++        self.serialize_scene_step = serialize_scene_step
+         self.lock = threading.Lock()
+         self.reset_count = 0
+         self.clear_cache_freq = max(1, int(self.args.get("clear_cache_freq", 8)))
++        self.action_dim = int(self.args.get("action_dim", 14))
++        self.execute_action_prefix_individually = bool(
++            self.args.get("execute_action_prefix_individually", False)
++        )
++        self.action_guard_enabled = _get_env_flag("ROBOTWIN_ACTION_GUARD_ENABLED", False)
++        self.action_guard_mode = os.getenv("ROBOTWIN_ACTION_GUARD_MODE", "nonfinite").strip().lower()
++        if self.action_guard_mode in {"0", "false", "off", "none", "disabled"}:
++            self.action_guard_enabled = False
++            self.action_guard_mode = "off"
++        elif self.action_guard_mode not in {"nonfinite", "clip"}:
++            logging.warning(
++                "Invalid ROBOTWIN_ACTION_GUARD_MODE=%r; using nonfinite.",
++                self.action_guard_mode,
++            )
++            self.action_guard_mode = "nonfinite"
++        self.action_delta_limit = None
++        self.action_guard_abs_limit = None
++        if self.action_guard_enabled and self.action_guard_mode == "clip":
++            self.action_delta_limit = _load_action_delta_limit(self.action_dim)
++            self.action_guard_abs_limit = _get_env_float(
++                "ROBOTWIN_ACTION_GUARD_ABS_LIMIT", 3.2
++            )
++        self.action_guard_log_every_n = max(
++            1, _get_env_int("ROBOTWIN_ACTION_GUARD_LOG_EVERY_N", 25)
++        )
++        self.action_guard_log_initial_n = max(
++            0, _get_env_int("ROBOTWIN_ACTION_GUARD_LOG_INITIAL_N", 3)
++        )
++        self.action_clip_count = 0
++        self.action_nonfinite_count = 0
++        if self.action_guard_enabled and self.env_id == 0:
++            logging.warning(
++                "RoboTwin action guard enabled: mode=%s action_dim=%s stats_path=%s "
++                "delta_range=%s abs_limit=%s.",
++                self.action_guard_mode,
++                self.action_dim,
++                os.getenv("ROBOTWIN_ACTION_STATS_PATH", "<unset>"),
++                _array_range(self.action_delta_limit)
++                if self.action_delta_limit is not None
++                else "<disabled>",
++                self.action_guard_abs_limit,
++            )
+ 
+     def setup_task(self):
+         self.close()
+@@ -97,21 +227,27 @@ class SubEnv:
+                 is_valid = False
+                 while not is_valid:
+                     try:
++                        setup_args = dict(self.args)
++                        setup_args.pop("instruction", None)
+                         task = class_decorator(self.task_name)
+                         task.setup_demo(
+                             now_ep_num=trial_seed,
+                             seed=trial_seed,
+                             is_test=True,
+-                            **self.args,
++                            **setup_args,
+                         )
+                         episode_info = task.get_info()
+                         is_valid = True
+                     except Exception as e:
+-                        task.close_env()
++                        # Throwaway seed-validation task: always fully destroy it
++                        # (final=True) so it never leaves a persistent scene
++                        # holding GPU memory, regardless of the reuse toggle.
++                        task.close_env(final=True)
+                         trial_seed += 1
+                         continue
+-                    task.close_env()
++                    task.close_env(final=True)
+ 
++                self.env_seed = trial_seed
+                 self.episode_info_list = [episode_info]
+ 
+     def create_instruction(self):
+@@ -125,8 +261,22 @@ class SubEnv:
+         if self.get_instruction() is None:
+             self.reset(env_seed=None)
+ 
++        if self.serialize_scene_step:
++            with self.global_lock:
++                return self._step_locked(actions)
++        return self._step_locked(actions)
++
++    def _step_locked(self, actions):
+         with self.lock:
+-            reward, termination, truncation, info = self.task.gen_sparse_reward_data(actions)
++            actions = self._guard_actions(actions)
++            if self.execute_action_prefix_individually:
++                reward, termination, truncation, info = self._execute_waypoint_prefix(
++                    actions
++                )
++            else:
++                reward, termination, truncation, info = self.task.gen_sparse_reward_data(
++                    actions
++                )
+             obs = update_obs(self.task.get_obs())
+             obs["instruction"] = self.task.get_instruction()
+ 
+@@ -138,26 +288,206 @@ class SubEnv:
+             "info": info,
+         }
+ 
++    def _execute_waypoint_prefix(self, actions):
++        actions = np.asarray(actions, dtype=np.float32)
++        if actions.ndim == 1:
++            actions = actions.reshape(1, -1)
++
++        info = {
++            "success": False,
++            "actual_exec_steps": 0,
++            "step_observations": [],
++        }
++        reward = np.array([0], dtype=np.float32)
++        termination = np.array([0], dtype=np.int32)
++        truncation = np.array([0], dtype=np.int32)
++
++        if getattr(self.task, "eval_success", False):
++            info["success"] = True
++            reward = np.array([1], dtype=np.float32)
++            termination = np.array([1], dtype=np.int32)
++            return reward, termination, truncation, info
++
++        if self.task.take_action_cnt >= self.task.step_lim:
++            truncation = np.array([1], dtype=np.int32)
++            return reward, termination, truncation, info
++
++        for action in actions:
++            if self.task.take_action_cnt >= self.task.step_lim:
++                truncation = np.array([1], dtype=np.int32)
++                break
++
++            self.task.take_action(action)
++            info["actual_exec_steps"] += 1
++            info["step_observations"].append(update_obs(self.task.get_obs()))
++
++            if getattr(self.task, "eval_success", False):
++                info["success"] = True
++                reward = np.array([1], dtype=np.float32)
++                termination = np.array([1], dtype=np.int32)
++                break
++
++        if (
++            not info["success"]
++            and self.task.take_action_cnt >= self.task.step_lim
++        ):
++            truncation = np.array([1], dtype=np.int32)
++
++        return reward, termination, truncation, info
++
++    def _current_action_layout(self):
++        try:
++            left_jointstate = self.task.robot.get_left_arm_jointState()
++            right_jointstate = self.task.robot.get_right_arm_jointState()
++        except Exception:
++            return None, 6, 6
++
++        left_arm_dim = max(0, len(left_jointstate) - 1)
++        right_arm_dim = max(0, len(right_jointstate) - 1)
++        current = np.asarray(left_jointstate + right_jointstate, dtype=np.float32)
++        if current.shape[0] < self.action_dim or not np.all(np.isfinite(current)):
++            current = None
++        else:
++            current = current[: self.action_dim]
++        return current, left_arm_dim, right_arm_dim
++
++    def _guard_actions(self, actions):
++        if not self.action_guard_enabled:
++            return actions
++
++        guarded = np.asarray(actions, dtype=np.float32)
++        if guarded.ndim == 1:
++            guarded = guarded.reshape(1, -1)
++        else:
++            guarded = guarded.copy()
++
++        if guarded.shape[-1] < self.action_dim:
++            logging.warning(
++                "RoboTwin action guard skipped env=%s due to short action shape=%s.",
++                self.env_id,
++                guarded.shape,
++            )
++            return guarded
++
++        action_view = guarded[..., : self.action_dim]
++        original = action_view.copy()
++        current, left_arm_dim, right_arm_dim = self._current_action_layout()
++
++        nonfinite_mask = ~np.isfinite(action_view)
++        if np.any(nonfinite_mask):
++            replacement = (
++                current
++                if current is not None
++                else np.zeros(self.action_dim, dtype=np.float32)
++            )
++            action_view[:] = np.where(nonfinite_mask, replacement, action_view)
++            self.action_nonfinite_count += 1
++
++        if self.action_guard_mode != "clip":
++            sanitized = not np.allclose(original, action_view, rtol=0.0, atol=1e-6)
++            if sanitized and (
++                self.action_nonfinite_count <= self.action_guard_log_initial_n
++                or self.action_nonfinite_count % self.action_guard_log_every_n == 0
++            ):
++                logging.warning(
++                    "RoboTwin action guard sanitized nonfinite env=%s "
++                    "nonfinite_batches=%s shape=%s input_range=%s output_range=%s "
++                    "current_range=%s.",
++                    self.env_id,
++                    self.action_nonfinite_count,
++                    guarded.shape,
++                    _array_range(original),
++                    _array_range(action_view),
++                    _array_range(current) if current is not None else "<unavailable>",
++                )
++            return guarded
++
++        right_arm_start = left_arm_dim + 1
++        right_arm_end = right_arm_start + right_arm_dim
++        gripper_indices = [
++            idx
++            for idx in (left_arm_dim, right_arm_end)
++            if 0 <= idx < self.action_dim
++        ]
++        arm_indices = np.asarray(
++            [
++                idx
++                for idx in list(range(0, left_arm_dim))
++                + list(range(right_arm_start, right_arm_end))
++                if 0 <= idx < self.action_dim
++            ],
++            dtype=np.int64,
++        )
++
++        if current is not None and self.action_delta_limit is not None and arm_indices.size:
++            lower = current - self.action_delta_limit[: self.action_dim]
++            upper = current + self.action_delta_limit[: self.action_dim]
++            action_view[:, arm_indices] = np.clip(
++                action_view[:, arm_indices],
++                lower[arm_indices],
++                upper[arm_indices],
++            )
++
++        if self.action_guard_abs_limit is not None and arm_indices.size:
++            abs_limit = abs(float(self.action_guard_abs_limit))
++            action_view[:, arm_indices] = np.clip(
++                action_view[:, arm_indices], -abs_limit, abs_limit
++            )
++
++        if gripper_indices:
++            action_view[:, gripper_indices] = np.clip(
++                action_view[:, gripper_indices], 0.0, 1.0
++            )
++
++        clipped = not np.allclose(original, action_view, rtol=0.0, atol=1e-6)
++        if clipped:
++            self.action_clip_count += 1
++            if (
++                self.action_clip_count <= self.action_guard_log_initial_n
++                or self.action_clip_count % self.action_guard_log_every_n == 0
++            ):
++                logging.warning(
++                    "RoboTwin action guard clipped env=%s count=%s "
++                    "nonfinite_batches=%s shape=%s input_range=%s output_range=%s "
++                    "current_range=%s.",
++                    self.env_id,
++                    self.action_clip_count,
++                    self.action_nonfinite_count,
++                    guarded.shape,
++                    _array_range(original),
++                    _array_range(action_view),
++                    _array_range(current) if current is not None else "<unavailable>",
++                )
++
++        return guarded
++
+     def reset(self, env_seed=None):
+         with self.global_lock:
+             with self.lock:
+                 if self.task is not None:
+                     self.reset_count += 1
+                     should_clear_cache = self.reset_count % self.clear_cache_freq == 0
+-                    self.task.close_env(clear_cache=should_clear_cache)
++                    # Per-episode reset: when ROBOTWIN_REUSE_SCENE is on, final=False
++                    # keeps the SAPIEN scene alive for setup_demo to clear+reuse. When
++                    # the toggle is off, final=False is a no-op and behavior is unchanged.
++                    self.task.close_env(
++                        clear_cache=should_clear_cache, final=False
++                    )
+                 if env_seed is not None:
+                     self.env_seed = env_seed
+ 
+                 self.instruction = self.create_instruction()
+                 self.args["instruction"] = self.instruction
+-
+                 trial_seed = self.env_seed
+                 is_valid = False
+                 while not is_valid:
+                     try:
+                         self.task.setup_demo(
+-                            now_ep_num=trial_seed, seed=trial_seed, **self.args
++                            now_ep_num=trial_seed,
++                            seed=trial_seed,
++                            **self.args,
+                         )
++                        episode_info = self.task.get_info()
+                         self.task.step_lim = self.args["step_lim"]
+                         self.task.run_steps = 0
+                         self.task.reward_step = 0
+@@ -166,16 +496,22 @@ class SubEnv:
+                         logging.warning(
+                             f"RoboTwin SubEnv {self.env_id} reset error with seed {trial_seed}, error: {e}, trying new seed: {trial_seed + 1}"
+                         )
+-                        self.task.close_env(clear_cache=True)
++                        # Error/retry path: genuinely destroy the (bad/partial)
++                        # scene so the retry builds a clean one. final=True is a
++                        # no-op difference when the reuse toggle is off.
++                        self.task.close_env(clear_cache=True, final=True)
+                         trial_seed += 1
+                         continue
+                     except Exception as e:
+                         logging.error(
+                             f"RoboTwin SubEnv {self.env_id} reset error with seed {trial_seed}, error: {e}"
+                         )
+-                        self.task.close_env(clear_cache=True)
++                        self.task.close_env(clear_cache=True, final=True)
+                         raise
+ 
++                self.env_seed = trial_seed
++                self.episode_info_list = [episode_info]
++
+         return
+ 
+     def get_obs(self):
+@@ -195,7 +531,11 @@ class SubEnv:
+     def close(self, clear_cache=True):
+         if self.task is not None:
+             with self.lock:
+-                self.task.close_env(clear_cache=clear_cache)
++                # Update-boundary / shutdown teardown: final=True genuinely
++                # destroys the SAPIEN scene (nulls scene/renderer/engine + gc +
++                # clear_cache) to return GPU memory for the actor's FSDP backward,
++                # even when ROBOTWIN_REUSE_SCENE is on.
++                self.task.close_env(clear_cache=clear_cache, final=True)
+ 
+     def check_seed(self, seed):
+         setup_demo_success = False
+@@ -205,7 +545,9 @@ class SubEnv:
+         with self.global_lock:
+             with self.lock:
+                 try:
+-                    self.task.setup_demo(now_ep_num=seed, seed=seed, **self.args)
++                    setup_args = dict(self.args)
++                    setup_args.pop("instruction", None)
++                    self.task.setup_demo(now_ep_num=seed, seed=seed, **setup_args)
+                     setup_demo_success = True
+                     _ = self.task.get_obs()
+                     _ = self.task.play_once()
+@@ -317,12 +659,31 @@ class VectorEnv(gym.Env):
+         self.envs = []
+         self.instruction_type = instruction_type
+ 
+-        self.global_lock = threading.Lock()
++        self.serialize_scene_step = _get_env_flag("ROBOTWIN_SERIALIZE_SCENE_STEP")
++        self.global_lock = (
++            _PROCESS_SCENE_LOCK if self.serialize_scene_step else threading.Lock()
++        )
+ 
+-        self.env_thread_pool = ThreadPoolExecutor(max_workers=n_envs)
++        self.env_thread_workers = _get_vector_env_max_workers(n_envs)
++        self.env_thread_pool = None
++        self._ensure_thread_pool()
++        if self.env_thread_workers < n_envs:
++            logging.warning(
++                "RoboTwin VectorEnv limited to %s worker(s) for %s env(s).",
++                self.env_thread_workers,
++                n_envs,
++            )
++        if self.serialize_scene_step:
++            logging.warning("RoboTwin VectorEnv serializes SAPIEN scene.step calls.")
+ 
+         self._init_envs()
+ 
++    def _ensure_thread_pool(self):
++        if self.env_thread_workers > 1 and self.env_thread_pool is None:
++            self.env_thread_pool = ThreadPoolExecutor(
++                max_workers=self.env_thread_workers
++            )
++
+     def _init_envs(self):
+         for i in range(self.n_envs):
+             sub_env = SubEnv(
+@@ -332,6 +693,7 @@ class VectorEnv(gym.Env):
+                 env_seed=self.env_seeds[i] if self.env_seeds else None,
+                 instruction_type=self.instruction_type,
+                 global_lock=self.global_lock,
++                serialize_scene_step=self.serialize_scene_step,
+             )
+             sub_env.setup_task()
+             self.envs.append(sub_env)
+@@ -355,6 +717,21 @@ class VectorEnv(gym.Env):
+         if len(self.envs) == 0:
+             self._init_envs()
+ 
++        if self.env_thread_workers == 1:
++            results = []
++            for i in range(self.n_envs):
++                try:
++                    results.append(self.envs[i].step(actions[i]))
++                except Exception as e:
++                    raise RuntimeError(f"SubEnv {i} step error: {e}")
++
++            obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = (
++                self.transform(results)
++            )
++
++            return obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv
++
++        self._ensure_thread_pool()
+         step_futures = {}
+         for i in range(self.n_envs):
+             future = self.env_thread_pool.submit(self.envs[i].step, actions[i])
+@@ -388,13 +765,26 @@ class VectorEnv(gym.Env):
+         else:
+             env_idx = [env_idx]
+ 
++        if self.env_thread_workers == 1:
++            for seed_pos, idx in enumerate(env_idx):
++                if 0 <= idx < self.n_envs:
++                    seed = None
++                    if env_seeds is not None and len(env_seeds) == len(env_idx):
++                        seed = env_seeds[seed_pos]
++
++                    try:
++                        self.envs[idx].reset(env_seed=seed)
++                    except Exception as e:
++                        raise RuntimeError(f"SubEnv {idx} reset error: {e}")
++            return
++
++        self._ensure_thread_pool()
+         reset_futures = {}
+-        for idx in env_idx:
++        for seed_pos, idx in enumerate(env_idx):
+             if 0 <= idx < self.n_envs:
+                 seed = None
+                 if env_seeds is not None and len(env_seeds) == len(env_idx):
+-                    seed_idx = env_idx.index(idx)
+-                    seed = env_seeds[seed_idx]
++                    seed = env_seeds[seed_pos]
+ 
+                 future = self.env_thread_pool.submit(
+                     self.envs[idx].reset, env_seed=seed
+@@ -421,6 +811,9 @@ class VectorEnv(gym.Env):
+             env.close(clear_cache=clear_cache)
+ 
+         if clear_cache:
++            if self.env_thread_pool is not None:
++                self.env_thread_pool.shutdown(wait=True, cancel_futures=True)
++                self.env_thread_pool = None
+             for env in self.envs:
+                 env = None
+             self.envs = []
+@@ -429,6 +822,17 @@ class VectorEnv(gym.Env):
+ 
+     def check_seeds(self, seeds: list[int]):
+         assert len(seeds) == self.n_envs
++
++        if self.env_thread_workers == 1:
++            results = []
++            for i in range(self.n_envs):
++                try:
++                    results.append(self.envs[i].check_seed(seeds[i]))
++                except Exception as e:
++                    raise RuntimeError(f"SubEnv {i} check seed error: {e}")
++            return results
++
++        self._ensure_thread_pool()
+         check_futures = {}
+         for i in range(self.n_envs):
+             future = self.env_thread_pool.submit(self.envs[i].check_seed, seeds[i])
+@@ -480,4 +884,4 @@ if __name__ == "__main__":
+             obs = (
+                 env.get_obs()
+             )
+-        env.close()
+\ No newline at end of file
++        env.close()
