@@ -54,6 +54,13 @@ class RealWorldEnv(gym.Env):
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.main_image_key = cfg.main_image_key
+        self.reward_image_keys = list(
+            cfg.get(
+                "reward_image_keys",
+                self.override_cfg.get("reward_camera_names", []),
+            )
+            or []
+        )
         self.manual_episode_control_only = bool(
             self.override_cfg.get("manual_episode_control_only", False)
         )
@@ -230,6 +237,23 @@ class RealWorldEnv(gym.Env):
 
         if raw_images:
             obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
+
+        reward_frames = raw_obs.get("reward_frames")
+        if reward_frames is not None:
+            missing_reward_image_keys = [
+                key for key in self.reward_image_keys if key not in reward_frames
+            ]
+            if missing_reward_image_keys:
+                raise KeyError(
+                    "Configured reward_image_keys are missing from reward_frames: "
+                    f"{missing_reward_image_keys}. Available reward frames: "
+                    f"{list(reward_frames)}."
+                )
+            if self.reward_image_keys:
+                obs["reward_main_images"] = np.stack(
+                    [reward_frames[key] for key in self.reward_image_keys],
+                    axis=1,
+                )
 
         obs = to_tensor(obs)
         obs["task_descriptions"] = self.task_descriptions

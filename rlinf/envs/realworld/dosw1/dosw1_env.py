@@ -63,6 +63,8 @@ class DOSW1Config:
     camera_names: list[str] = field(
         default_factory=lambda: ["cam_front", "cam_left", "cam_right"]
     )
+    reward_camera_names: Optional[list[str]] = None
+    reward_image_size: int = 336
     enable_camera_player: bool = True
     is_dummy: bool = False
 
@@ -553,7 +555,11 @@ class DOSW1Env(gym.Env):
                 dtype=np.float64,
             ),
         }
-        return copy.deepcopy({"state": state, "frames": self._get_camera_frames()})
+        frames, reward_frames = self._get_camera_frames()
+        observation = {"state": state, "frames": frames}
+        if reward_frames:
+            observation["reward_frames"] = reward_frames
+        return copy.deepcopy(observation)
 
     def _calc_step_reward(self, obs: dict, gripper_changed: bool = False) -> float:
         del obs, gripper_changed
@@ -569,45 +575,63 @@ class DOSW1Env(gym.Env):
         action_high[6] = action_high[13] = gripper_high
         self.action_space = gym.spaces.Box(low=action_low, high=action_high)
 
-        self.observation_space = gym.spaces.Dict(
-            {
-                "state": gym.spaces.Dict(
-                    {
-                        "left_joint_positions": gym.spaces.Box(
-                            -np.inf,
-                            np.inf,
-                            shape=(NUM_JOINTS,),
-                        ),
-                        "left_gripper": gym.spaces.Box(
-                            gripper_low,
-                            gripper_high,
-                            shape=(1,),
-                        ),
-                        "right_joint_positions": gym.spaces.Box(
-                            -np.inf,
-                            np.inf,
-                            shape=(NUM_JOINTS,),
-                        ),
-                        "right_gripper": gym.spaces.Box(
-                            gripper_low,
-                            gripper_high,
-                            shape=(1,),
-                        ),
-                    }
-                ),
-                "frames": gym.spaces.Dict(
-                    {
-                        name: gym.spaces.Box(
-                            0,
-                            255,
-                            shape=(IMAGE_H, IMAGE_W, 3),
-                            dtype=np.uint8,
-                        )
-                        for name in camera_names
-                    }
-                ),
-            }
-        )
+        observation_spaces = {
+            "state": gym.spaces.Dict(
+                {
+                    "left_joint_positions": gym.spaces.Box(
+                        -np.inf,
+                        np.inf,
+                        shape=(NUM_JOINTS,),
+                    ),
+                    "left_gripper": gym.spaces.Box(
+                        gripper_low,
+                        gripper_high,
+                        shape=(1,),
+                    ),
+                    "right_joint_positions": gym.spaces.Box(
+                        -np.inf,
+                        np.inf,
+                        shape=(NUM_JOINTS,),
+                    ),
+                    "right_gripper": gym.spaces.Box(
+                        gripper_low,
+                        gripper_high,
+                        shape=(1,),
+                    ),
+                }
+            ),
+            "frames": gym.spaces.Dict(
+                {
+                    name: gym.spaces.Box(
+                        0,
+                        255,
+                        shape=(IMAGE_H, IMAGE_W, 3),
+                        dtype=np.uint8,
+                    )
+                    for name in camera_names
+                }
+            ),
+        }
+        reward_camera_names = self.effective_reward_camera_names()
+        if reward_camera_names:
+            reward_image_size = int(self.config.reward_image_size)
+            if reward_image_size <= 0:
+                raise ValueError(
+                    "DOSW1 reward_image_size must be positive when "
+                    "reward_camera_names is configured."
+                )
+            observation_spaces["reward_frames"] = gym.spaces.Dict(
+                {
+                    name: gym.spaces.Box(
+                        0,
+                        255,
+                        shape=(reward_image_size, reward_image_size, 3),
+                        dtype=np.uint8,
+                    )
+                    for name in reward_camera_names
+                }
+            )
+        self.observation_space = gym.spaces.Dict(observation_spaces)
 
     def _go_to_home(self) -> None:
         self.sdk.left_go_joint(
@@ -627,6 +651,20 @@ class DOSW1Env(gym.Env):
         names = self.config.camera_names or []
         return names[: len(serials)] if serials else names
 
+    def effective_reward_camera_names(self) -> list[str]:
+        reward_camera_names = list(self.config.reward_camera_names or [])
+        available_camera_names = self.effective_camera_names()
+        unknown_camera_names = sorted(
+            set(reward_camera_names) - set(available_camera_names)
+        )
+        if unknown_camera_names:
+            raise ValueError(
+                "DOSW1 reward_camera_names contains unavailable cameras: "
+                f"{unknown_camera_names}. Available cameras: "
+                f"{available_camera_names}."
+            )
+        return reward_camera_names
+
     def _open_cameras(self) -> None:
         serials = self.config.camera_serials or self._discover_camera_serials()
         self.config.camera_serials = list(serials)
@@ -642,21 +680,32 @@ class DOSW1Env(gym.Env):
             camera.close()
         self._cameras.clear()
 
-    def _get_camera_frames(self) -> dict[str, np.ndarray]:
+    def _get_camera_frames(
+        self,
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         frames: dict[str, np.ndarray] = {}
+        reward_frames: dict[str, np.ndarray] = {}
         display_frames: dict[str, np.ndarray] = {}
+        reward_camera_names = set(self.effective_reward_camera_names())
+        reward_image_size = int(self.config.reward_image_size)
         for camera in self._cameras:
-            frame_rgb = camera.get_frame()
-            height, width = frame_rgb.shape[:2]
+            frame_bgr = camera.get_frame()
+            height, width = frame_bgr.shape[:2]
             crop = min(height, width)
             start_x = (width - crop) // 2
             start_y = (height - crop) // 2
-            cropped = frame_rgb[start_y : start_y + crop, start_x : start_x + crop]
+            cropped = frame_bgr[start_y : start_y + crop, start_x : start_x + crop]
             resized = cv2.resize(cropped, (IMAGE_W, IMAGE_H))
             frames[camera.name] = resized[..., ::-1]
             display_frames[camera.name] = resized
+            if camera.name in reward_camera_names:
+                reward_resized = cv2.resize(
+                    cropped,
+                    (reward_image_size, reward_image_size),
+                )
+                reward_frames[camera.name] = reward_resized[..., ::-1]
         self._camera_player.put_frame(display_frames)
-        return frames
+        return frames, reward_frames
 
     @staticmethod
     def _discover_camera_serials() -> list[str]:

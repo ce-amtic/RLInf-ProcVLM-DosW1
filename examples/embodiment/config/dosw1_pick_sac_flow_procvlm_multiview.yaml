@@ -1,0 +1,36 @@
+defaults:
+  - dosw1_pick_sac_flow_procvlm_base
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+runner:
+  logger:
+    experiment_name: "dosw1_pick_sac_flow_procvlm_multiview"
+
+env:
+  train:
+    reward_image_keys: [cam_front, cam_left, cam_right]
+    override_cfg:
+      reward_camera_names: [cam_front, cam_left, cam_right]
+      reward_image_size: ${oc.env:DOSW1_PROCVLM_REWARD_IMAGE_SIZE,336}
+
+  eval:
+    reward_image_keys: [cam_front, cam_left, cam_right]
+    override_cfg:
+      reward_camera_names: [cam_front, cam_left, cam_right]
+      reward_image_size: ${oc.env:DOSW1_PROCVLM_REWARD_IMAGE_SIZE,336}
+
+reward:
+  model:
+    input_builder_params:
+      image_keys: [reward_main_images]
+      prompt_template: 'Given the recent synchronized multi-view observations and the task "{task}", first infer the remaining atomic actions required to complete the task. Images are ordered by time and, within each timestamp, as front, left, and right views. Then estimate the current completion percentage and output it as a float wrapped by <progress> tags.'
+    history_buffers:
+      history_window:
+        history_keys: [reward_main_images]

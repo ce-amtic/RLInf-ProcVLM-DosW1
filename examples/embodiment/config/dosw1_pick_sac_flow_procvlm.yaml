@@ -1,0 +1,10 @@
+defaults:
+  - dosw1_pick_sac_flow_procvlm_base
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/

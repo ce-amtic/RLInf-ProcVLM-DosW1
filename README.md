@@ -444,8 +444,8 @@ We welcome applications from Postdocs, PhD/Master's students, and interns. Join 
 ## RLInf + ProcVLM for DOS-W1
 
 This repository archives the validated RLInf–ProcVLM reward-model integration
-used with RoboTwin and provides the starting point for porting that integration
-to the DOS-W1 real-robot workflow already supported by RLInf.
+used with RoboTwin and ports the reusable reward path to RLInf's DOS-W1
+real-robot SAC/RLPD workflow.
 
 ProcVLM is referenced as the public `third_party/ProcVLM` Git submodule rather
 than copied from a private working tree. Clone with submodules enabled:
@@ -464,8 +464,23 @@ The checkpoint used by the validated 127 deployment is currently:
 ```
 
 See [ProcVLM integration notes](docs/procvlm_integration.md) and the
-[archive manifest](docs/archive_manifest.md). The RoboTwin result is validated;
-the DOS-W1 ProcVLM reward adaptation is the next implementation stage and is
-not claimed complete in this initial archive.
+[archive manifest](docs/archive_manifest.md). The implementation includes:
+
+- stage 1: the standard DOS-W1 actor observations plus a single-view ProcVLM
+  temporal reward window;
+- stage 2: an independent, configurable high-resolution multi-view stream used
+  only by ProcVLM while actor observations remain unchanged.
+
+Launch either mode after configuring the robot, actor checkpoint, ProcVLM
+environment, and a DOS-W1-calibrated ProcVLM checkpoint:
+
+```bash
+bash run_dosw1_procvlm.sh single
+bash run_dosw1_procvlm.sh multiview
+```
+
+The code path and dummy/unit tests are complete. Physical-robot safety checks,
+camera serials, workspace limits, demonstrations, and reward calibration remain
+deployment-specific and must be validated before online training.
 
 ---

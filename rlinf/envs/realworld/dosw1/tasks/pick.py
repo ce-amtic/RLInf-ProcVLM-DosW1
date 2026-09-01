@@ -38,6 +38,8 @@ def _default_lift_joint() -> np.ndarray:
 class PickConfig(DOSW1Config):
     """Configuration for the DOSW1 single-arm pick task."""
 
+    task_description: str = "Pick up the object with the left arm."
+
     target_grasp_joint: np.ndarray = field(default_factory=_default_grasp_joint)
     target_lift_joint: np.ndarray = field(default_factory=_default_lift_joint)
 
@@ -78,7 +80,7 @@ class PickEnv(DOSW1Env):
 
     @property
     def task_description(self) -> str:
-        return "Pick up the object with the left arm."
+        return self.config.task_description
 
     def reset(
         self,
