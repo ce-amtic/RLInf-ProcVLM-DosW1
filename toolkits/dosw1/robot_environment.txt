@@ -1,0 +1,16 @@
+# Robot node verified environment; 2026-09-11
+# Python 3.11.14
+rlinf==0.2.0
+ray==2.58.0
+torch==2.6.0
+torchvision==0.21.0
+numpy==2.4.6
+hydra-core==1.4.0.dev9
+omegaconf==2.4.0.dev15
+grpcio==1.70.0
+protobuf==5.29.6
+airbot_py==5.1.6
+pyrealsense2==2.58.4.10922
+opencv-python==5.0.0.93
+tensorboard==2.20.0
+swanlab==0.7.20
