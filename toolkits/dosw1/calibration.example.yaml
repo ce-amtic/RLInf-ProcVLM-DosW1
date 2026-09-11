@@ -1,0 +1,12 @@
+# This records the observed idle neighborhood; it is not a calibrated pick workspace.
+# Validate home/reset, table clearance and object location before setting true.
+motion_validated: false
+env:
+  right_reset_joint: [0, 0, 0, 0, 0, 0]
+  right_reset_gripper: 0.0
+  joint_limit_min: [-3.1416, -2.9671, -0.087266, -3.0107, -1.7628, -3.0107]
+  joint_limit_max: [2.0944, 0.17453, 3.1416, 3.0107, 1.7628, 3.0107]
+  right_ee_pose_limit_min: [0.276, -0.010, 0.200]
+  right_ee_pose_limit_max: [0.296, 0.010, 0.220]
+  max_joint_delta: 0.01
+  reset_to_home: false

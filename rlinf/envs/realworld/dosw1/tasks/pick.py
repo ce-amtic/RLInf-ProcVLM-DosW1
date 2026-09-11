@@ -38,6 +38,8 @@ def _default_lift_joint() -> np.ndarray:
 class PickConfig(DOSW1Config):
     """Configuration for the DOSW1 single-arm pick task."""
 
+    task_arm: str = "left"
+
     task_description: str = "Pick up the object with the left arm."
 
     target_grasp_joint: np.ndarray = field(default_factory=_default_grasp_joint)
@@ -54,6 +56,7 @@ class PickConfig(DOSW1Config):
 
     enable_gripper_penalty: bool = False
     gripper_penalty: float = 0.05
+    use_task_reward: bool = True
     use_dense_reward: bool = True
     step_frequency: float = 10.0
 
@@ -68,8 +71,11 @@ class PickEnv(DOSW1Env):
         hardware_info=None,
         env_idx: int = 0,
     ) -> None:
+        config = PickConfig(**override_cfg)
+        if config.task_arm not in config.active_arms:
+            raise ValueError("task_arm must be an active arm")
         super().__init__(
-            PickConfig(**override_cfg),
+            config,
             worker_info,
             hardware_info,
             env_idx,
@@ -102,16 +108,17 @@ class PickEnv(DOSW1Env):
             self.task_success and not self.config.manual_episode_control_only
         ) or self.manual_done:
             terminated = True
+        info["success"] = bool(self.task_success or self.manual_done)
         return obs, reward, terminated, truncated, info
 
     def _calc_step_reward(self, obs: dict, gripper_changed: bool = False) -> float:
         del obs
-        if self.config.is_dummy:
+        if self.config.is_dummy or not self.config.use_task_reward:
             return 0.0
 
         cfg: PickConfig = self.config
-        left_joint = self.robot_state.left_joint_positions
-        left_gripper = self.robot_state.left_gripper
+        left_joint = getattr(self.robot_state, f"{cfg.task_arm}_joint_positions")
+        left_gripper = getattr(self.robot_state, f"{cfg.task_arm}_gripper")
         grasp_joint = np.asarray(cfg.target_grasp_joint, dtype=np.float64).reshape(6)
         lift_joint = np.asarray(cfg.target_lift_joint, dtype=np.float64).reshape(6)
         sharpness = float(cfg.joint_reward_sharpness)
@@ -154,7 +161,8 @@ class PickEnv(DOSW1Env):
         right_joint = self.robot_state.right_joint_positions
         right_home = np.asarray(cfg.right_reset_joint, dtype=np.float64).reshape(6)
         right_dist_sq = float(np.sum(np.square(right_joint - right_home)))
-        reward -= cfg.right_arm_home_penalty * right_dist_sq
+        if cfg.task_arm == "left" and "right" in cfg.active_arms:
+            reward -= cfg.right_arm_home_penalty * right_dist_sq
 
         return float(np.clip(reward, -1.0, 1.0))
 
