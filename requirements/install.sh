@@ -1673,7 +1673,14 @@ install_dosw1_env() {
 
     local repo_root
     repo_root="$(dirname "$SCRIPT_DIR")"
-    uv pip install -e "$repo_root" --no-deps
+    # airbot_py 5.1.6 pins grpcio/protobuf; resolve the embodied stack with
+    # those constraints together so newer logging/cloud clients remain valid.
+    local sdk_args=()
+    if [ -f "$dosw1_sdk_wheel" ]; then
+        sdk_args+=("$dosw1_sdk_wheel")
+    fi
+    uv pip install --constraint "$SCRIPT_DIR/dosw1/constraints.txt" \
+        -e "$repo_root[embodied]" "${sdk_args[@]}"
 }
 
 install_habitat_env() {

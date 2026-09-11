@@ -1,5 +1,7 @@
 # DOS-W1 真机部署：RLInf + ProcVLM
 
+> 本机当前使用右臂 + Top 单相机。请优先阅读 [机器人节点部署与预检](dosw1_robot_node.md) 和 [GPU 节点部署](dosw1_gpu_node.md)。下文保留原双臂方案。
+
 本文说明如何在 Dexmal DOS-W1 双臂机器人上运行本仓库的默认 SAC-Flow + RLPD 真机流程。流程采用 RLinf 官方的双节点结构：GPU 节点运行 actor、rollout 和可选的 ProcVLM 奖励服务；机器人控制节点运行 DOS-W1 环境、AirBot gRPC 服务和 RealSense 相机。
 
 ## 1. 运行前提

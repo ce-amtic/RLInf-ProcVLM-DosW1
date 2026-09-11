@@ -1,0 +1,96 @@
+defaults:
+- dosw1_right_top_sac_flow
+- _self_
+cluster:
+  component_placement:
+    reward:
+      node_group: gpu
+      placement: 0
+reward:
+  use_reward_model: true
+  group_name: RewardGroup
+  standalone_realworld: false
+  reward_mode: history_buffer
+  history_reward_assign: false
+  reward_weight: 1.0
+  env_reward_weight: 0.0
+  enable_offload: false
+  offload_before_actor_update: false
+  async_queue:
+    enabled: true
+    max_pending: 4
+    merge_max_requests: 4
+    merge_wait_timeout_s: 0.01
+  model:
+    model_type: procvlm_history_vlm
+    model_path: ${oc.env:PROCVLM_REWARD_MODEL_PATH}
+    procvlm_repo_path: ${oc.env:PROCVLM_REPO_PATH}
+    procvlm_python: ${oc.env:PROCVLM_PYTHON}
+    procvlm_server_script: ${oc.env:REPO_PATH}/rlinf/models/embodiment/reward/procvlm_reward_server.py
+    backend: transformers_subprocess
+    enable_value_head: false
+    precision: bf16
+    torch_dtype: bf16
+    attn_implementation: sdpa
+    reward_form: delta
+    pos_clip: 0.2
+    neg_clip: 0.2
+    invalid_delta_reward: 0.0
+    reset_progress_on_done: true
+    progress_smoothing:
+      enabled: false
+      alpha: 0.9
+    gt_success_bonus: 0.0
+    input_builder_name: procvlm_progress_input_builder
+    input_builder_params:
+      history_buffer_name: history_window
+      image_keys:
+      - reward_main_images
+      default_task_description: ${env.train.override_cfg.task_description}
+      force_default_task_description: false
+      prompt_template: Given the recent observation and the task "{task}", first infer
+        the remaining atomic actions required to complete the task. Then estimate
+        the current completion percentage and output it as a float wrapped by <progress>
+        tags.
+    reward_parser_name: procvlm_progress_reward_parser
+    reward_parser_params:
+      normalize: true
+      invalid_progress: 0.0
+    history_reward_assign: false
+    history_buffers:
+      history_window:
+        history_size: 8
+        min_history_size: 8
+        input_interval: 3
+        history_keys:
+        - reward_main_images
+        input_on_done: true
+    interval_reward: 0.0
+    infer_micro_batch_size: 1
+    max_new_tokens: 128
+    do_sample: false
+    temperature: 0.0
+    eager_init: true
+    warmup_on_init: true
+    base_cost_mb: 100
+    image_cost_mb: 75
+    show_progress: false
+    debug_samples:
+      enabled: false
+env:
+  train:
+    reward_image_keys:
+    - cam_front
+    override_cfg:
+      reward_camera_names:
+      - cam_front
+      reward_image_size: 336
+  eval:
+    reward_image_keys:
+    - cam_front
+    override_cfg: ${env.train.override_cfg}
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

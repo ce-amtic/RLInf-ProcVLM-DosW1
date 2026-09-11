@@ -48,6 +48,7 @@ class DOSW1SDKAdapter:
         self._leader_arm_enabled = bool(config.enable_human_in_loop)
         self._connected = False
         self._robot: object | None = None
+        self._native = None
 
     def connect(self) -> None:
         """Connect to follower and optional leader arms."""
@@ -55,6 +56,16 @@ class DOSW1SDKAdapter:
             self._connected = True
             return
 
+        if self._config.sdk_backend == "airbot_native":
+            from .airbot_native import NativeAirbot
+
+            self._native = NativeAirbot(self._config)
+            self._connected = True
+            return
+        if self._config.active_arms != ["left", "right"]:
+            raise ValueError("Single-arm operation requires sdk_backend=airbot_native")
+        if self._config.read_only:
+            raise ValueError("Read-only operation requires sdk_backend=airbot_native")
         if _AirbotRobot is None or _AirbotSDKConfig is None:
             raise ImportError(
                 "airbot_sdk is not installed. Install it or set is_dummy=True."
@@ -98,6 +109,9 @@ class DOSW1SDKAdapter:
     def disconnect(self) -> None:
         """Disconnect the wrapped AirbotRobot instance."""
         self._logger.info("[DOSW1SDK] Disconnecting.")
+        if self._native is not None:
+            self._native.close()
+            self._native = None
         robot = self._robot
         self._robot = None
         self._connected = False
@@ -113,7 +127,9 @@ class DOSW1SDKAdapter:
         """Toggle leader-arm linkage used by teleoperation."""
         enabled = bool(enabled)
         self._leader_arm_enabled = enabled
-        if self._config.is_dummy:
+        if self._config.is_dummy or self._native is not None:
+            if enabled and self._native is not None:
+                raise ValueError("Leader arms unavailable in native backend")
             return
         robot = self._require_connected()
         config_ = getattr(robot, "config_", None)
@@ -128,6 +144,8 @@ class DOSW1SDKAdapter:
         """Return left follower arm state ``(7,)``."""
         if self._config.is_dummy:
             return np.zeros(7)
+        if self._native is not None:
+            return self._native.joint("left")
         robot = self._require_connected()
         return np.asarray(
             self._get_robot_joint(robot, getter_name="left_get_joint"),
@@ -138,6 +156,8 @@ class DOSW1SDKAdapter:
         """Return right follower arm state ``(7,)``."""
         if self._config.is_dummy:
             return np.zeros(7)
+        if self._native is not None:
+            return self._native.joint("right")
         robot = self._require_connected()
         return np.asarray(
             self._get_robot_joint(robot, getter_name="right_get_joint"),
@@ -146,8 +166,14 @@ class DOSW1SDKAdapter:
 
     def get_state(self) -> DOSW1RobotState:
         """Return a unified follower-arm state snapshot."""
-        left = self.get_left_joint()
-        right = self.get_right_joint()
+        left = (
+            self.get_left_joint() if "left" in self._config.active_arms else np.zeros(7)
+        )
+        right = (
+            self.get_right_joint()
+            if "right" in self._config.active_arms
+            else np.zeros(7)
+        )
         return DOSW1RobotState(
             left_joint_positions=left[:6].copy(),
             left_gripper=float(left[6]),
@@ -161,10 +187,9 @@ class DOSW1SDKAdapter:
         if self._config.is_dummy:
             return
         open_width = float(getattr(self._config, "gripper_width_max", 0.07))
-        left = self.get_left_joint()
-        right = self.get_right_joint()
-        self.left_go_joint(left[:6].tolist(), open_width)
-        self.right_go_joint(right[:6].tolist(), open_width)
+        for side in self._config.active_arms:
+            current = getattr(self, f"get_{side}_joint")()
+            getattr(self, f"{side}_go_joint")(current[:6].tolist(), open_width)
 
     def get_left_lead_joint(self) -> np.ndarray:
         """Return left leader arm state ``(7,)``."""
@@ -192,10 +217,12 @@ class DOSW1SDKAdapter:
         gripper: float,
         *,
         interp: bool = False,
-    ) -> None:
+    ) -> np.ndarray | None:
         """Command the left follower arm to target joint positions."""
         if self._config.is_dummy:
             return
+        if self._native is not None:
+            return self._native.command("left", joint, gripper, interp=interp)
         robot = self._require_connected()
         robot.left_go_joint(list(joint), float(gripper), interp=interp)
 
@@ -205,10 +232,12 @@ class DOSW1SDKAdapter:
         gripper: float,
         *,
         interp: bool = False,
-    ) -> None:
+    ) -> np.ndarray | None:
         """Command the right follower arm to target joint positions."""
         if self._config.is_dummy:
             return
+        if self._native is not None:
+            return self._native.command("right", joint, gripper, interp=interp)
         robot = self._require_connected()
         robot.right_go_joint(list(joint), float(gripper), interp=interp)
 
@@ -216,6 +245,8 @@ class DOSW1SDKAdapter:
         """Compute ee_pose from joint angles via SDK FK (arm-agnostic)."""
         if self._config.is_dummy:
             return np.zeros(6)
+        if self._native is not None:
+            return self._native.kinematics(joint)
         robot = self._require_connected()
         return np.asarray(robot.fk(joint), dtype=np.float64)
 
@@ -223,6 +254,8 @@ class DOSW1SDKAdapter:
         """Return current left arm ee_pose."""
         if self._config.is_dummy:
             return np.zeros(6)
+        if self._native is not None:
+            return self._native.pose("left")
         robot = self._require_connected()
         return np.asarray(robot.left_get_pose(), dtype=np.float64)
 
@@ -230,6 +263,8 @@ class DOSW1SDKAdapter:
         """Return current right arm ee_pose."""
         if self._config.is_dummy:
             return np.zeros(6)
+        if self._native is not None:
+            return self._native.pose("right")
         robot = self._require_connected()
         return np.asarray(robot.right_get_pose(), dtype=np.float64)
 

@@ -1,0 +1,87 @@
+defaults:
+  - dosw1_pick_sac_flow_base
+  - _self_
+
+cluster:
+  node_groups:
+    - label: gpu
+      node_ranks: 0
+    - label: dosw1
+      node_ranks: 1
+      env_configs:
+        - node_ranks: 1
+          python_interpreter_path: ${oc.env:DOSW1_ROBOT_PYTHON,/home/ubuntu/RLInf-ProcVLM-DosW1/.venv/bin/python}
+          env_vars:
+            - PYTHONPATH: ${oc.env:DOSW1_ROBOT_REPO,/home/ubuntu/RLInf-ProcVLM-DosW1}
+      hardware:
+        type: DOSW1
+        configs:
+          - robot_url: ${oc.env:DOSW1_ROBOT_URL,127.0.0.1}
+            right_arm_port: 50053
+            camera_serials: ["420222072569"]
+            node_rank: 1
+
+runner:
+  ckpt_path: ${oc.env:DOSW1_POLICY_CHECKPOINT}
+
+algorithm:
+  entropy_tuning:
+    target_entropy: -7
+  length_params:
+    max_new_token: 7
+  demo_buffer:
+    load_path: ${oc.env:DOSW1_DEMO_BUFFER_PATH}
+
+actor:
+  model:
+    model_path: ${oc.env:DOSW1_POLICY_MODEL_PATH}
+    state_dim: 7
+    action_dim: 7
+    image_num: 1
+rollout:
+  model:
+    model_path: ${actor.model.model_path}
+
+env:
+  train:
+    main_image_key: cam_front
+    keyboard_intervention_wrapper: false
+    override_cfg:
+      active_arms: [right]
+      task_arm: right
+      task_description: "Pick up and lift the object with the right arm."
+      sdk_backend: airbot_native
+      urdf_path: ${oc.env:DOSW1_URDF_PATH,/home/ubuntu/dos_w1/airbot/airbot_api/config/airbot_urdf/play_g2/urdf/play_g2.urdf}
+      read_only: true
+      move_on_init: false
+      reset_to_home: false
+      enable_human_in_loop: false
+      enable_camera_player: false
+      camera_backend: shared_frame
+      camera_serials: ["420222072569"]
+      camera_names: [cam_front]
+      camera_shared_dirs: ["/dev/shm/ruc-video/front"]
+      joint_limit_min: [-3.1416, -2.9671, -0.087266, -3.0107, -1.7628, -3.0107]
+      joint_limit_max: [2.0944, 0.17453, 3.1416, 3.0107, 1.7628, 3.0107]
+      max_joint_delta: 0.01
+      action_scale: 1.0
+      # Joint-space rewards require calibration; ProcVLM-only defaults below.
+      use_task_reward: false
+      use_dense_reward: false
+      grasp_bonus: 0.0
+      right_arm_home_penalty: 0.0
+      lift_threshold: 0.0
+      right_reset_joint: [0, 0, 0, 0, 0, 0]
+      right_reset_gripper: 0.0
+      # Commissioning box around the observed idle pose, NOT a task workspace.
+      right_ee_pose_limit_min: [0.276, -0.01, 0.200]
+      right_ee_pose_limit_max: [0.296, 0.01, 0.220]
+  eval:
+    main_image_key: cam_front
+    keyboard_intervention_wrapper: false
+    override_cfg: ${env.train.override_cfg}
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

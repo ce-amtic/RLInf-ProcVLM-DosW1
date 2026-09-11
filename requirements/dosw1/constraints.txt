@@ -1,0 +1,8 @@
+# airbot_py 5.1.6 pins grpcio and protobuf. Keep logging/cloud clients compatible.
+grpcio==1.70.0
+protobuf==5.29.6
+tensorboard<2.21
+swanlab<0.10
+google-api-core<2.30
+proto-plus<1.28
+googleapis-common-protos<1.75

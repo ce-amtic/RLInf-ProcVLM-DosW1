@@ -59,6 +59,15 @@ class DOSW1Config:
     left_lead_port: int = 50050
     right_lead_port: int = 50052
 
+    active_arms: list[str] = field(default_factory=lambda: ["left", "right"])
+    sdk_backend: str = "airbot_sdk"
+    urdf_path: str = ""
+    state_timeout_s: float = 0.5
+    read_only: bool = False
+    move_on_init: bool = True
+    reset_to_home: bool = True
+    camera_backend: str = "realsense"
+    camera_shared_dirs: list[str] = field(default_factory=list)
     camera_serials: Optional[list[str]] = None
     camera_names: list[str] = field(
         default_factory=lambda: ["cam_front", "cam_left", "cam_right"]
@@ -87,6 +96,7 @@ class DOSW1Config:
         default_factory=lambda: np.full(NUM_JOINTS, 3.14)
     )
 
+    max_gripper_delta: float = 0.005
     max_joint_delta: float = float("inf")
     action_scale: float = 1.0
 
@@ -130,6 +140,15 @@ class DOSW1Env(gym.Env):
     ) -> None:
         self._logger = get_logger()
         self.config = config
+        if config.active_arms not in (["left", "right"], ["right"], ["left"]):
+            raise ValueError("active_arms must be [left, right], [right], or [left]")
+        if config.sdk_backend not in ("airbot_sdk", "airbot_native"):
+            raise ValueError("Unknown DOSW1 sdk_backend")
+        if len(config.active_arms) == 1 and config.enable_human_in_loop:
+            raise ValueError(
+                "Single-arm configuration currently has no leader teleoperation"
+            )
+        self.action_dim = 7 * len(config.active_arms)
         self.env_idx = env_idx
         self.node_rank = 0
         self.env_worker_rank = 0
@@ -142,8 +161,8 @@ class DOSW1Env(gym.Env):
             self._apply_hardware_info(hardware_info)
             self.sdk = DOSW1SDKAdapter(config)
             self.sdk.connect()
-            self._go_to_home()
-            time.sleep(1.0)
+            if config.move_on_init and not config.read_only:
+                self._go_to_home()
 
         self.robot_state = DOSW1RobotState()
         self._num_steps = 0
@@ -169,7 +188,11 @@ class DOSW1Env(gym.Env):
 
         self._cameras: list[BaseCamera] = []
         if not config.is_dummy:
-            self._open_cameras()
+            try:
+                self._open_cameras()
+            except Exception:
+                self.close()
+                raise
         self._camera_player = VideoPlayer(config.enable_camera_player)
 
         if not config.is_dummy:
@@ -216,7 +239,8 @@ class DOSW1Env(gym.Env):
             )
             self.set_control_mode(next_mode, source="reset_after_start_key")
         else:
-            self._go_to_home()
+            if self.config.reset_to_home and not self.config.read_only:
+                self._go_to_home()
             self.set_control_mode(ControlMode.MODEL, source="reset_no_human_in_loop")
         self._num_steps = 0
         self.manual_done = False
@@ -226,8 +250,10 @@ class DOSW1Env(gym.Env):
 
     def step(self, action: np.ndarray) -> tuple[dict, float, bool, bool, dict]:
         t0 = time.time()
-        action = np.asarray(action, dtype=np.float64).reshape(ACTION_DIM)
+        action = np.asarray(action, dtype=np.float64).reshape(self.action_dim)
 
+        if not np.isfinite(action).all():
+            raise ValueError("Action contains NaN or infinity")
         if self.config.is_dummy:
             self._num_steps += 1
             obs = self._get_observation()
@@ -287,7 +313,10 @@ class DOSW1Env(gym.Env):
     def set_control_mode(self, mode: ControlMode, *, source: str = "unknown") -> None:
         self.control_mode = mode
         self._set_leader_follow_enabled(
-            enabled=bool(self.in_free_teleop or mode == ControlMode.TELEOP),
+            enabled=bool(
+                self.config.enable_human_in_loop
+                and (self.in_free_teleop or mode == ControlMode.TELEOP)
+            ),
             source=f"{source}:{getattr(mode, 'name', mode)}",
         )
 
@@ -306,6 +335,8 @@ class DOSW1Env(gym.Env):
                     )
 
     def _dispatch_action(self, policy_action: np.ndarray) -> np.ndarray:
+        if self.config.read_only:
+            return self._execute_pause_action()
         if self.control_mode == ControlMode.MODEL:
             return self._execute_model_action(policy_action)
         if self.control_mode == ControlMode.PAUSE:
@@ -368,54 +399,34 @@ class DOSW1Env(gym.Env):
 
     def _execute_model_action(self, action: np.ndarray) -> np.ndarray:
         cfg = self.config
-        cur_left = self.robot_state.left_joint_positions
-        cur_right = self.robot_state.right_joint_positions
-
-        left_target = cur_left + cfg.action_scale * (action[:6] - cur_left)
-        right_target = cur_right + cfg.action_scale * (action[7:13] - cur_right)
-
-        left_target = np.clip(
-            left_target,
-            cur_left - cfg.max_joint_delta,
-            cur_left + cfg.max_joint_delta,
-        )
-        right_target = np.clip(
-            right_target,
-            cur_right - cfg.max_joint_delta,
-            cur_right + cfg.max_joint_delta,
-        )
-
-        left_joint = np.clip(left_target, cfg.joint_limit_min, cfg.joint_limit_max)
-        right_joint = np.clip(right_target, cfg.joint_limit_min, cfg.joint_limit_max)
-
-        left_joint = self._clip_joint_to_ee_safety_box(
-            cur_left, left_joint, side="left"
-        )
-        right_joint = self._clip_joint_to_ee_safety_box(
-            cur_right, right_joint, side="right"
-        )
-
-        left_gripper = self._clip_gripper_width(float(action[6]))
-        right_gripper = self._clip_gripper_width(float(action[13]))
-
-        self.sdk.left_go_joint(left_joint.tolist(), left_gripper)
-        self.sdk.right_go_joint(right_joint.tolist(), right_gripper)
-
-        actual = np.empty(ACTION_DIM, dtype=np.float64)
-        actual[:6] = left_joint
-        actual[6] = left_gripper
-        actual[7:13] = right_joint
-        actual[13] = right_gripper
-        return actual
+        actual = []
+        for index, side in enumerate(cfg.active_arms):
+            current = getattr(self.robot_state, f"{side}_joint_positions")
+            command = action[index * 7 : (index + 1) * 7]
+            target = current + cfg.action_scale * (command[:6] - current)
+            target = np.clip(
+                target, current - cfg.max_joint_delta, current + cfg.max_joint_delta
+            )
+            target = np.clip(target, cfg.joint_limit_min, cfg.joint_limit_max)
+            target = self._clip_joint_to_ee_safety_box(current, target, side)
+            gripper = self._clip_gripper_width(command[6])
+            applied = getattr(self.sdk, f"{side}_go_joint")(target.tolist(), gripper)
+            if isinstance(applied, np.ndarray):
+                actual.extend(applied)
+            else:
+                actual.extend([*target, gripper])
+        return np.asarray(actual, dtype=np.float64)
 
     def _execute_pause_action(self) -> np.ndarray:
-        state = self.robot_state
-        actual = np.empty(ACTION_DIM, dtype=np.float64)
-        actual[:6] = state.left_joint_positions
-        actual[6] = state.left_gripper
-        actual[7:13] = state.right_joint_positions
-        actual[13] = state.right_gripper
-        return actual
+        return np.concatenate(
+            [
+                np.r_[
+                    getattr(self.robot_state, f"{side}_joint_positions"),
+                    getattr(self.robot_state, f"{side}_gripper"),
+                ]
+                for side in self.config.active_arms
+            ]
+        )
 
     def snapshot_teleop_init(self) -> None:
         self._teleop_init_lead_left = self.sdk.get_left_lead_joint().copy()
@@ -555,6 +566,11 @@ class DOSW1Env(gym.Env):
                 dtype=np.float64,
             ),
         }
+        if len(self.config.active_arms) == 1:
+            side = self.config.active_arms[0]
+            state = {
+                side: np.r_[state[f"{side}_joint_positions"], state[f"{side}_gripper"]]
+            }
         frames, reward_frames = self._get_camera_frames()
         observation = {"state": state, "frames": frames}
         if reward_frames:
@@ -569,10 +585,10 @@ class DOSW1Env(gym.Env):
         camera_names = self.effective_camera_names()
         gripper_low = float(self.config.gripper_width_min)
         gripper_high = float(self.config.gripper_width_max)
-        action_low = np.full(ACTION_DIM, -np.pi, dtype=np.float32)
-        action_high = np.full(ACTION_DIM, np.pi, dtype=np.float32)
-        action_low[6] = action_low[13] = gripper_low
-        action_high[6] = action_high[13] = gripper_high
+        action_low = np.full(self.action_dim, -np.pi, dtype=np.float32)
+        action_high = np.full(self.action_dim, np.pi, dtype=np.float32)
+        action_low[6::7] = gripper_low
+        action_high[6::7] = gripper_high
         self.action_space = gym.spaces.Box(low=action_low, high=action_high)
 
         observation_spaces = {
@@ -631,20 +647,45 @@ class DOSW1Env(gym.Env):
                     for name in reward_camera_names
                 }
             )
+        if len(self.config.active_arms) == 1:
+            observation_spaces["state"] = gym.spaces.Dict(
+                {
+                    self.config.active_arms[0]: gym.spaces.Box(
+                        -np.inf, np.inf, shape=(7,), dtype=np.float64
+                    )
+                }
+            )
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
     def _go_to_home(self) -> None:
-        self.sdk.left_go_joint(
-            self.config.left_reset_joint,
-            self.config.left_reset_gripper,
-            interp=True,
-        )
-        self.sdk.right_go_joint(
-            self.config.right_reset_joint,
-            self.config.right_reset_gripper,
-            interp=True,
-        )
-        time.sleep(3.0)
+        if self.config.read_only:
+            return
+        if self.config.sdk_backend != "airbot_native":
+            for side in self.config.active_arms:
+                getattr(self.sdk, f"{side}_go_joint")(
+                    getattr(self.config, f"{side}_reset_joint"),
+                    getattr(self.config, f"{side}_reset_gripper"),
+                    interp=True,
+                )
+            time.sleep(3.0)
+            return
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            self.robot_state = self.sdk.get_state()
+            target = np.concatenate(
+                [
+                    np.r_[
+                        getattr(self.config, f"{side}_reset_joint"),
+                        getattr(self.config, f"{side}_reset_gripper"),
+                    ]
+                    for side in self.config.active_arms
+                ]
+            )
+            if np.max(np.abs(self._execute_pause_action() - target)) < 0.01:
+                return
+            self._execute_model_action(target)
+            time.sleep(1.0 / self.config.step_frequency)
+        raise TimeoutError("Bounded home reset did not reach the target")
 
     def effective_camera_names(self) -> list[str]:
         serials = self.config.camera_serials or []
@@ -671,7 +712,22 @@ class DOSW1Env(gym.Env):
         names = self.config.camera_names or []
         for index, serial in enumerate(serials):
             name = names[index] if index < len(names) else f"cam_{index}"
-            camera = create_camera(CameraInfo(name=name, serial_number=serial))
+            if self.config.camera_backend == "shared_frame":
+                from rlinf.envs.realworld.common.camera.shared_frame_camera import (
+                    SharedFrameCamera,
+                )
+
+                if len(self.config.camera_shared_dirs) != len(serials):
+                    raise ValueError("camera_shared_dirs must match camera_serials")
+                camera = SharedFrameCamera(
+                    name, self.config.camera_shared_dirs[index], serial
+                )
+            elif self.config.camera_backend == "realsense":
+                camera = create_camera(CameraInfo(name=name, serial_number=serial))
+            else:
+                raise ValueError(
+                    f"Unknown camera backend: {self.config.camera_backend}"
+                )
             camera.open()
             self._cameras.append(camera)
 
